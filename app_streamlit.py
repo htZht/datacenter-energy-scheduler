@@ -181,54 +181,60 @@ st.title("⚡ 多能协同调度平台")
 
 # ====== 侧边栏：配置 + 开关 ======
 with st.sidebar:
-   st.divider()
-   st.subheader("🌍 地理与规模")
-region = st.selectbox("选择大区", list(REGIONS.keys()))
-province = st.selectbox("选择省份", REGIONS[region])
-      
-       # 负荷
+    st.subheader("🌍 地理与规模")
+    region = st.selectbox("选择大区", list(REGIONS.keys()))
+    province = st.selectbox("选择省份", REGIONS[region])
+    
     st.divider()
-    st.subheader("📈 Load Profiles")
-    base_elec = st.slider("Base Electric Load (kW)", 500, 10000, 3000)
-    cool_ratio = st.slider("Cooling Load Ratio", 0.0, 1.0, 0.5)
-    heat_ratio = st.slider("Heating Load Ratio", 0.0, 1.0, 0.4)
+    st.subheader("📈 负荷配置")
+    base_elec = st.slider("基础电负荷 (kW)", 500, 10000, 3000)
+    cool_ratio = st.slider("冷负荷比例", 0.0, 1.0, 0.5)
+    heat_ratio = st.slider("热负荷比例", 0.0, 1.0, 0.4)
 
+    st.divider()
     st.subheader("🔧 设备开关")
     pv_on = st.checkbox("光伏系统", True)
     wind_on = st.checkbox("风电系统", True)
     gt_on = st.checkbox("燃气轮机", True)
     h2_on = st.checkbox("氢能系统", True)
     monitor_on = st.checkbox("硬件监测", True)
-    
-    st.subheader("☀️ 光伏参数")
-    pv_type = st.selectbox("光伏技术", list(PV_TECH.keys()))
-    pv_area = st.number_input("安装面积 (m²)", 100, 50000, 5000)
-    
-    st.subheader("💨 风电参数")
-    wt_type = st.selectbox("风机型号", list(WIND_MODELS.keys()))
-    n_wt = st.number_input("风机数量", 0, 50, 3)
-    # 燃气轮机（新增硬件参数）
-    st.divider()
-    st.subheader("🔥 Gas Turbine")
-    gt_on = st.checkbox("Enable Gas Turbine", True)
-    if gt_on:
-        gt_type = st.selectbox("GT Model", list(GT_MODELS.keys()))
-        gt_capacity = st.number_input("Rated Capacity (kW)", 1000, 200000, 5000)
-    
-    # 锅炉
-    st.divider()
-    st.subheader("♨️ Thermal Systems")
-    boiler_cap = st.number_input("Gas Boiler Capacity (kW)", 0, 50000, 3000)
-    h2_on = st.checkbox("Enable H₂ Fuel Cell", False)
-    h2_cap = st.number_input("H₂ Fuel Cell Capacity (kW)", 0, 5000, 1000 if h2_on else 0)
 
+    if pv_on:
+        st.subheader("☀️ 光伏参数")
+        pv_type = st.selectbox("光伏技术", list(PV_TECH.keys()))
+        pv_area = st.number_input("安装面积 (m²)", 100, 50000, 5000)
+        tilt = st.slider("倾角 (°)", 0, 90, 25)
+        azimuth = st.slider("方位角 (°)", -180, 180, 0)
+        inv_eff = st.slider("逆变器效率", 0.8, 1.0, 0.97)
+        soiling = st.slider("污渍损失", 0.0, 0.2, 0.03)
+    else:
+        # 设置默认值避免未定义
+        pv_type, pv_area, tilt, azimuth, inv_eff, soiling = "", 0, 0, 0, 0.97, 0.03
+
+    if wind_on:
+        st.subheader("💨 风电参数")
+        wt_type = st.selectbox("风机型号", list(WIND_MODELS.keys()))
+        n_wt = st.number_input("风机数量", 0, 50, 3)
+    else:
+        wt_type, n_wt = "", 0
+
+    if gt_on:
+        st.subheader("🔥 燃气轮机")
+        gt_type = st.selectbox("型号", list(GT_MODELS.keys()))
+        gt_capacity = st.number_input("额定容量 (kW)", 1000, 200000, 5000)
+    else:
+        gt_type, gt_capacity = "", 0
+
+    st.subheader("♨️ 热力系统")
+    boiler_cap = st.number_input("燃气锅炉容量 (kW)", 0, 50000, 3000)
+    h2_cap = st.number_input("氢燃料电池容量 (kW)", 0, 5000, 1000 if h2_on else 0)
 # ====== 主界面 ======
 if st.button("🚀 生成调度方案", type="primary"):
     # --- 构建负荷 ---
     h = np.arange(24)
-    P_load = base_load * (0.6 + 0.4 * np.sin(2 * np.pi * (h - 8) / 24))
-    Q_cool = base_load * 0.5 * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h - 14) / 24)))
-    Q_heat = base_load * 0.4 * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h + 3) / 24)))
+    P_load = base_elec * (0.6 + 0.4 * np.sin(2 * np.pi * (h - 8) / 24))
+    Q_cool = base_elec * 0.5 * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h - 14) / 24)))
+    Q_heat = base_elec * 0.4 * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h + 3) / 24)))
     
     # --- 可再生出力（考虑开关）---
     ghi, wind_spd, temp = get_weather(province)
