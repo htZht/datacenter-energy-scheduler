@@ -1,33 +1,25 @@
 # config.py
-def build_config(device_config, regional_config):
-    return {
-        'T': 24,
-        'timezone': regional_config['timezone'],
-        'CAP_GRID_BUY': 300,
-        'CAP_GRID_SELL': 100,
-        'CAP_BOILER': device_config['boiler_max'],
-        'CAP_CHILL_ELEC': device_config['chiller_elec_max'],
-        'CAP_CHILL_ABS': device_config['chiller_abs_max'],
-        'BESS_CAPACITY': device_config['bess_capacity'],
-        'BESS_MAX_POWER': device_config['bess_max_power'],
-        'BESS_EFF': 0.9,
-        'BESS_SOC_MIN': 0.2,
-        'BESS_SOC_MAX': 0.9,
-        'TES_CAPACITY': device_config['tes_capacity'],
-        'TES_MAX_POWER': min(device_config['tes_capacity'] / 8, 150),
-        'TES_EFF': 0.95,
-        'TES_TEMP_MIN': 0.2,
-        'TES_TEMP_MAX': 0.9,
-        'PRICE_GRID_BUY': regional_config['price_buy'],
-        'PRICE_GRID_SELL': regional_config['price_sell'],
-        'PRICE_GAS': 4.84 / 10.8,
-        'CARBON_GRID': regional_config['carbon_grid'],
-        'CARBON_GAS': 180.0e-6,
-        'EMR_SOLAR': 5.89e10,
-        'EMR_WIND': 1.0e11,     # 风能能值比（典型值）
-        'EMR_GRID': 1.74e8,
-        'EMR_GAS': 7.73e7,
-        'EMR_ASSET': 4.325e15,
-        'PV_AREA': device_config['pv_area'],
-        'PV_EFF': device_config['pv_efficiency']
-    }
+class Config:
+    # DEAP 参数
+    POP_SIZE = 80
+    N_GEN = 60
+    MUT_PB = 0.2
+    CX_PB = 0.7
+
+    # 系统约束
+    BATTERY_MIN_SOC = 0.05
+    BATTERY_MAX_SOC = 0.95
+    H2_TANK_MIN = 1.0      # kg
+    H2_TANK_MAX = 200.0    # kg
+
+    # 能值系数 (seJ/J)
+    EMERGY_SOLAR = 1.0
+    EMERGY_WIND = 1.0
+    EMERGY_GRID = 3.0      # 中国电网平均
+    EMERGY_NG = 5.0        # 天然气
+    EMERGY_H2 = 8.0        # 电解氢
+
+    # 㶲系数
+    EXERGY_GRID = 0.75
+    EXERGY_NG = 0.86
+    EXERGY_H2 = 1.20

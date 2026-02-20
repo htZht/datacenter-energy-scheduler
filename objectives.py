@@ -1,39 +1,34 @@
 # objectives.py
-from energy_system import check_energy_balance, calculate_safety_penalty
 import numpy as np
+from exergy_model import calculate_exergy_loss
+from emergy_model import calculate_emergy_indicators
 
-def _base_cost(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config):
-    penalty = check_energy_balance(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    safety_pen = calculate_safety_penalty(x, config)
-    T = config['T']
-    X = np.array(x).reshape(9, T)
-    cost = np.sum(config['PRICE_GRID_BUY']*X[0] - config['PRICE_GRID_SELL']*X[1] + config['PRICE_GAS']*X[2])
-    return cost + penalty * 1e3 + safety_pen
-
-def economic_cost(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config):
-    return (float(_base_cost(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)),)
-
-def carbon_emission(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config):
-    penalty = check_energy_balance(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    safety_pen = calculate_safety_penalty(x, config)
-    T = config['T']
-    X = np.array(x).reshape(9, T)
-    carbon = np.sum(config['CARBON_GRID']*X[0] + config['CARBON_GAS']*X[2])
-    return (float(carbon + penalty * 1e3 + safety_pen),)
-
-def negative_ESI(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config):
-    from emergy_analysis import calculate_ESI
-    penalty = check_energy_balance(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    safety_pen = calculate_safety_penalty(x, config)
-    ESI, _, _ = calculate_ESI(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    return (float(-ESI + penalty * 1e3 + safety_pen),)
-
-def weighted_objective(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config, w1=1.0, w2=0.0, w3=0.0):
-    cost = _base_cost(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    T = config['T']
-    X = np.array(x).reshape(9, T)
-    carbon = np.sum(config['CARBON_GRID']*X[0] + config['CARBON_GAS']*X[2])
-    from emergy_analysis import calculate_ESI
-    ESI, _, _ = calculate_ESI(x, P_pv, P_wind, P_el, Q_cool, Q_heat, config)
-    obj = w1 * cost + w2 * carbon + w3 * (-ESI)
-    return (float(obj),)
+def multi_objective_function(individual, context):
+    """
+    多目标：经济成本 + 㶲损失 + 能值可持续性
+    individual: [grid, battery, gt, h2fc] * horizon
+    """
+    horizon = len(context["load"])
+    grid = individual[0::4]
+    battery = individual[1::4]
+    gt = individual[2::4]
+    h2fc = individual[3::4]
+    
+    # 经济成本
+    cost = sum(g * p for g, p in zip(grid, context["price"]))
+    
+    # 㶲损失
+    ex_loss = calculate_exergy_loss(grid, gt, h2fc, 
+                                   context["pv"], context["wind"], context["load"])
+    
+    # 能值指标（惩罚低 ESI）
+    emergy = calculate_emergy_indicators(
+        pv_energy=sum(context["pv"]),
+        wind_energy=sum(context["wind"]),
+        grid_energy=sum(grid),
+        ng_energy=sum(gt) * 0.3,  # m³
+        h2_energy=sum(h2fc) * 0.4 / 33.3  # kg
+    )
+    esi_penalty = 1.0 / (emergy["ESI"] + 1e-5)  # 鼓励高 ESI
+    
+    return cost, ex_loss, esi_penalty

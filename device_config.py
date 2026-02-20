@@ -1,16 +1,21 @@
-# device_config.py —— 替换为以下内容
-def get_device_config():
-    """
-    返回固定设备配置（Web 模式下不交互）
-    实际项目中可从数据库/配置文件读取
-    """
-    return {
-        'pv_area': 400,
-        'pv_efficiency': 0.175,
-        'boiler_max': 200,
-        'chiller_elec_max': 150,
-        'chiller_abs_max': 100,
-        'bess_capacity': 500,
-        'bess_max_power': 100,
-        'tes_capacity': 2000
-    }
+# device_config.py
+DEVICE_CONFIG = {
+    "battery": {
+        "capacity_kwh": 500.0,
+        "efficiency": 0.95,
+        "max_power_kw": 100.0
+    },
+    "hydrogen": {
+        "tank_capacity_kg": 100.0,
+        "electrolysis_max_kw": 100.0,
+        "fuelcell_max_kw": 100.0,
+        "h2_lhv_kwh_per_kg": 33.3
+    },
+    "gas_turbine": {
+        "max_power_kw": 300.0,
+        "ng_consumption_m3_per_kwh": 0.3,
+        "ng_price_yuan_per_m3": 3.5
+    },
+    "pv": {"capacity_kw": 100.0},
+    "wind": {"capacity_kw": 150.0}
+}
