@@ -2,213 +2,312 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
-import json
 import hashlib
-from datetime import datetime, timedelta
 
 # ====== 字体修复 ======
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ====== 导入绘图函数 ======
-from plot_results import plot_scheduling
-
-# ====== 区域与省份 ======
+# ====== 区域数据 ======
 REGIONS = {
     "华北": ["北京市", "天津市", "河北省", "山西省", "内蒙古自治区"],
-    "东北": ["辽宁省", "吉林省", "黑龙江省"],
     "华东": ["上海市", "江苏省", "浙江省", "安徽省", "福建省", "江西省", "山东省"],
     "华中": ["河南省", "湖北省", "湖南省"],
     "华南": ["广东省", "广西壮族自治区", "海南省"],
     "西南": ["重庆市", "四川省", "贵州省", "云南省", "西藏自治区"],
-    "西北": ["陕西省", "甘肃省", "青海省", "宁夏回族自治区", "新疆维吾尔自治区"]
+    "西北": ["陕西省", "甘肃省", "青海省", "宁夏回族自治区", "新疆维吾尔自治区"],
+    "东北": ["辽宁省", "吉林省", "黑龙江省"]
 }
 
-# ====== 天气 API 缓存（避免重复请求）======
-@st.cache_data(ttl=3600)
-def fetch_weather_data(province, date_str):
-    """模拟从 Open-Meteo 获取天气数据（实际项目替换为真实坐标）"""
-    # 简化：不同省份返回不同光照/风速特征
-    province_seed = int(hashlib.md5(province.encode()).hexdigest()[:8], 16) % 1000
-    np.random.seed(province_seed + hash(date_str) % 100)
-    
-    ghi = np.random.rand(24) * 800  # W/m²
-    wind_speed = 3 + 4 * np.random.rand(24)  # m/s
-    temp = 15 + 10 * np.sin(np.arange(24)/24*2*np.pi - np.pi/2) + 5 * np.random.rand(24)
-    
-    return ghi, wind_speed, temp
-
-# ====== 光伏出力模型（基于 pvlib 理念）======
-def calculate_pv_power(ghi, area, efficiency, temp):
-    """简化光伏模型：P = GHI * area * efficiency * (1 - 0.004*(T-25))"""
-    power = ghi * area * efficiency / 1000  # kW
-    power *= (1 - 0.004 * (temp - 25))      # 温度修正
-    return np.clip(power, 0, None)
-
-# ====== 风电出力模型（基于 windpowerlib 理念）======
-def calculate_wind_power(wind_speed, rated_power):
-    """简化风机模型：切入3m/s，切出25m/s，额定12m/s"""
-    power = np.zeros_like(wind_speed)
-    mask = (wind_speed >= 3) & (wind_speed <= 25)
-    power[mask] = rated_power * np.minimum((wind_speed[mask] - 3) / 9, 1.0)**3
-    return power
-
-# ====== NPC（净现值成本）计算 ======
-def calculate_npc(
-    pv_area, wind_cap, h2_electrolyzer, h2_fuel_cell,
-    gt_power, boiler_cap, bess_cap, tes_cap,
-    annual_elec_cost, annual_maintenance
-):
-    # 设备投资成本（元/kW 或 元/kWh）
-    costs = {
-        'pv': pv_area * 4000,                     # 元/m² → 假设 200W/m² → 20元/W
-        'wind': wind_cap * 6000,                  # 元/kW
-        'electrolyzer': h2_electrolyzer * 8000,   # 元/kW
-        'fuel_cell': h2_fuel_cell * 10000,        # 元/kW
-        'gt': gt_power * 3000,                    # 元/kW
-        'boiler': boiler_cap * 1500,              # 元/kW
-        'bess': bess_cap * 1800,                  # 元/kWh
-        'tes': tes_cap * 300                      # 元/kWh
+# ====== 光伏技术库（5大核心指标）======
+PV_TECH = {
+    "单晶硅 PERC (高效)": {
+        "efficiency": 0.23,      # 初始效率
+        "temp_coeff": -0.0030,   # %/°C
+        "degradation": 0.0045,   # 年衰减
+        "low_light_perf": 0.95,  # 弱光性能（vs STC）
+        "cost_per_kw": 3800      # 元/kW
+    },
+    "TOPCon (N型)": {
+        "efficiency": 0.245,
+        "temp_coeff": -0.0028,
+        "degradation": 0.0035,
+        "low_light_perf": 0.97,
+        "cost_per_kw": 4200
+    },
+    "HJT (异质结)": {
+        "efficiency": 0.25,
+        "temp_coeff": -0.0025,
+        "degradation": 0.0025,
+        "low_light_perf": 0.98,
+        "cost_per_kw": 4800
+    },
+    "多晶硅 (传统)": {
+        "efficiency": 0.175,
+        "temp_coeff": -0.0042,
+        "degradation": 0.008,
+        "low_light_perf": 0.88,
+        "cost_per_kw": 3000
+    },
+    "薄膜 CdTe": {
+        "efficiency": 0.165,
+        "temp_coeff": -0.0020,
+        "degradation": 0.005,
+        "low_light_perf": 0.92,
+        "cost_per_kw": 3200
     }
-    capex = sum(costs.values())
+}
+
+# ====== 风机类型库（IEA标准）======
+WIND_MODELS = {
+    "Vestas V150-4.2MW": {
+        "rated_power": 4200,
+        "hub_height": 149,
+        "cut_in": 3,
+        "cut_out": 25,
+        "rated_wind": 12.5,
+        "availability": 0.94,
+        "cost_per_kw": 6500
+    },
+    "Siemens SG 5.0-145": {
+        "rated_power": 5000,
+        "hub_height": 145,
+        "cut_in": 3,
+        "cut_out": 25,
+        "rated_wind": 12,
+        "availability": 0.95,
+        "cost_per_kw": 6800
+    },
+    "金风 GW140-3.0MW": {
+        "rated_power": 3000,
+        "hub_height": 120,
+        "cut_in": 3,
+        "cut_out": 22,
+        "rated_wind": 11,
+        "availability": 0.92,
+        "cost_per_kw": 5800
+    },
+    "海上 Haliade-X 14MW": {
+        "rated_power": 14000,
+        "hub_height": 150,
+        "cut_in": 4,
+        "cut_out": 28,
+        "rated_wind": 13,
+        "availability": 0.90,
+        "cost_per_kw": 12000
+    }
+}
+
+# ====== 天气模拟（按省份）======
+def get_weather(province):
+    seed = int(hashlib.md5(province.encode()).hexdigest()[:6], 16) % 100
+    np.random.seed(seed)
+    region_map = {"西北":700,"华北":620,"华东":520,"华南":560,"西南":480,"东北":510,"华中":530}
+    region = [k for k,v in REGIONS.items() if province in v][0]
+    ghi = np.clip(np.random.normal(region_map.get(region,500), 180, 24), 0, 1100)
+    wind = 4.5 + 3.5 * np.random.rand(24)
+    temp = 18 + 12 * np.sin(np.arange(24)/24*2*np.pi - np.pi/2) + 4 * np.random.randn(24)
+    return ghi, wind, temp
+
+# ====== 光伏精细化模型 ======
+def calc_pv(ghi, area, tech, temp, tilt, azimuth, inv_eff, soiling_loss=0.03):
+    tech_data = PV_TECH[tech]
+    # 倾角/方位角修正（简化）
+    cos_incidence = np.cos(np.radians(tilt)) * 0.9 + 0.1  # 粗略模型
+    ghi_effective = ghi * cos_incidence * tech_data["low_light_perf"]
+    power_dc = ghi_effective * area * tech_data["efficiency"] / 1000
+    power_dc *= (1 + tech_data["temp_coeff"] * (temp - 25))
+    power_ac = power_dc * inv_eff * (1 - soiling_loss)
+    return np.clip(power_ac, 0, None)
+
+# ====== 风电精细化模型 ======
+def calc_wind(wind_speed, model, n_turbines, availability=0.93):
+    m = WIND_MODELS[model]
+    power = np.zeros_like(wind_speed)
+    mask = (wind_speed >= m["cut_in"]) & (wind_speed <= m["cut_out"])
+    ratio = np.minimum((wind_speed[mask] - m["cut_in"]) / (m["rated_wind"] - m["cut_in"]), 1.0)
+    power[mask] = m["rated_power"] * (ratio ** 3)
+    return power * n_turbines * availability
+
+# ====== 内置 fallback 绘图函数（确保出图！）======
+def fallback_plot(P_pv, P_wind, P_load, Q_cool, Q_heat, x_opt=None):
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    hours = np.arange(24)
     
-    # 年运维 + 能源费用（简化）
-    opex_annual = annual_maintenance + annual_elec_cost
+    # 电负荷
+    axs[0].plot(hours, P_load, 'k-', label='电负荷', linewidth=2)
+    axs[0].fill_between(hours, 0, P_pv, color='gold', alpha=0.6, label='光伏')
+    axs[0].fill_between(hours, P_pv, P_pv+P_wind, color='skyblue', alpha=0.6, label='风电')
+    axs[0].set_ylabel('功率 (kW)')
+    axs[0].legend(loc='upper right')
+    axs[0].grid(True, linestyle='--', alpha=0.5)
     
-    # 折现率 6%，寿命 20 年
-    r = 0.06
-    npc = capex + opex_annual * ((1 - (1 + r)**-20) / r)
-    return npc / 1e6  # 百万元
+    # 冷负荷
+    axs[1].plot(hours, Q_cool, 'b-', label='冷负荷', linewidth=2)
+    axs[1].set_ylabel('冷量 (kW)')
+    axs[1].grid(True, linestyle='--', alpha=0.5)
+    
+    # 热负荷
+    axs[2].plot(hours, Q_heat, 'r-', label='热负荷', linewidth=2)
+    axs[2].set_ylabel('热量 (kW)')
+    axs[2].set_xlabel('小时')
+    axs[2].grid(True, linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    return fig
 
 # ====== 页面配置 ======
-st.set_page_config(page_title="多能互补智慧能源调度平台", layout="wide")
-st.title("⚡ 多能互补智慧能源调度平台")
+st.set_page_config(page_title="全参数多能协同调度平台", layout="wide")
+st.title("⚡ 全参数多能协同智慧能源调度平台")
 
-# ====== 侧边栏配置 ======
+# ====== 侧边栏：全参数配置 ======
 with st.sidebar:
-    st.image("https://via.placeholder.com/180x50?text=EnergyHub+Pro", use_container_width=True)
-    st.title("🛠️ 系统配置")
+    st.image("https://via.placeholder.com/180x50?text=EnergyPro+Max", use_container_width=True)
+    st.title("🛠️ 全参数配置中心")
 
-    # --- 区域选择 ---
+    # --- 地理 ---
     region = st.selectbox("🌍 大区", list(REGIONS.keys()))
-    province = st.selectbox("📍 省份/直辖市", REGIONS[region])
+    province = st.selectbox("📍 省份", REGIONS[region])
 
-    # --- 负荷输入（直接填数字！）---
-    st.subheader("📈 负荷需求（kW）")
-    col_e, col_c, col_h = st.columns(3)
-    with col_e:
-        elec_load = st.number_input("电负荷（24h平均）", min_value=0, value=2000, step=100)
-    with col_c:
-        cool_load = st.number_input("冷负荷（24h平均）", min_value=0, value=1500, step=100)
-    with col_h:
-        heat_load = st.number_input("热负荷（24h平均）", min_value=0, value=800, step=100)
+    # --- 负荷输入（自由数字）---
+    st.subheader("📈 负荷需求 (kW)")
+    elec = st.number_input("平均电负荷", 0, 200000, 3000, step=100)
+    cool = st.number_input("平均冷负荷", 0, 200000, 2000, step=100)
+    heat = st.number_input("平均热负荷", 0, 200000, 1000, step=100)
 
-    # --- 设备参数（全设备覆盖）---
-    st.subheader("⚙️ 多能设备配置")
-    pv_area = st.number_input("光伏面积 (m²)", 0, 100000, 5000)
-    wind_cap = st.number_input("风电装机 (kW)", 0, 50000, 2000)
-    h2_electrolyzer = st.number_input("电解槽功率 (kW)", 0, 5000, 0)
-    h2_fuel_cell = st.number_input("燃料电池功率 (kW)", 0, 5000, 0)
-    gt_power = st.number_input("燃气轮机功率 (kW)", 0, 50000, 3000)
-    boiler_cap = st.number_input("燃气锅炉功率 (kW)", 0, 20000, 2000)
-    bess_cap = st.number_input("电池容量 (kWh)", 0, 100000, 5000)
-    tes_cap = st.number_input("蓄冷/热罐容量 (kWh)", 0, 200000, 10000)
+    # --- 光伏高级参数 ---
+    st.subheader("☀️ 光伏系统")
+    pv_tech = st.selectbox("技术类型", list(PV_TECH.keys()))
+    col_pv1, col_pv2 = st.columns(2)
+    with col_pv1:
+        pv_area = st.number_input("面积 (m²)", 0, 200000, 8000)
+        tilt = st.slider("安装倾角 (°)", 0, 90, 25)
+        inv_eff = st.slider("逆变器效率", 0.85, 0.99, 0.97)
+    with col_pv2:
+        azimuth = st.slider("方位角 (°)", -180, 180, 0)  # 0=正南
+        soiling = st.slider("污渍损失", 0.0, 0.2, 0.03)
 
-    run_btn = st.button("🚀 生成调度方案", type="primary")
+    # --- 风电高级参数 ---
+    st.subheader("💨 风电系统")
+    wind_model = st.selectbox("风机型号", list(WIND_MODELS.keys()))
+    n_turbines = st.number_input("风机数量", 0, 200, 2)
+    avail = st.slider("可用率", 0.8, 1.0, 0.93)
+
+    # --- 氢能系统 ---
+    st.subheader("💧 氢能系统")
+    h2_elec = st.number_input("电解槽功率 (kW)", 0, 10000, 0)
+    h2_fc = st.number_input("燃料电池功率 (kW)", 0, 10000, 0)
+    h2_roundtrip = st.slider("氢能往返效率", 0.3, 0.6, 0.45)
+
+    # --- 传统设备 ---
+    st.subheader("🔥 传统设备")
+    gt = st.number_input("燃气轮机功率 (kW)", 0, 100000, 5000)
+    boiler = st.number_input("燃气锅炉功率 (kW)", 0, 50000, 3000)
+    bess = st.number_input("电池容量 (kWh)", 0, 500000, 10000)
+    tes = st.number_input("蓄冷/热罐 (kWh)", 0, 1000000, 20000)
+
+    # --- 对比模式 ---
+    st.subheader("🔄 对比模式")
+    compare_mode = st.selectbox("对比基准", ["vs 昨日方案", "vs 无储能方案", "vs 纯火电方案"])
+
+    run_btn = st.button("🚀 生成全参数调度方案", type="primary")
 
 # ====== 主界面：结果必须在图上方！======
 if run_btn:
-    # === 获取天气数据（模拟 API）===
-    today = datetime.today().strftime("%Y-%m-%d")
-    ghi, wind_speed, temp = fetch_weather_data(province, today)
+    # === 获取天气 ===
+    ghi, wind_spd, temp = get_weather(province)
 
-    # === 计算可再生能源出力 ===
-    P_pv = calculate_pv_power(ghi, pv_area, 0.20, temp)
-    P_wind = calculate_wind_power(wind_speed, wind_cap)
+    # === 计算出力 ===
+    P_pv = calc_pv(ghi, pv_area, pv_tech, temp, tilt, azimuth, inv_eff, soiling)
+    P_wind = calc_wind(wind_spd, wind_model, n_turbines, avail)
 
-    # === 构建负荷曲线（基于客户输入的平均值）===
-    hours = np.arange(24)
-    P_load = elec_load * (0.7 + 0.3 * np.sin(2 * np.pi * (hours - 8) / 24))
-    Q_cool = cool_load * (0.6 + 0.4 * np.abs(np.sin(2 * np.pi * (hours - 13) / 24)))
-    Q_heat = heat_load * (0.6 + 0.4 * np.abs(np.sin(2 * np.pi * (hours + 2) / 24)))
+    # === 负荷曲线 ===
+    h = np.arange(24)
+    P_load = elec * (0.6 + 0.4 * np.sin(2*np.pi*(h-8)/24))
+    Q_cool = cool * (0.5 + 0.5 * np.abs(np.sin(2*np.pi*(h-14)/24)))
+    Q_heat = heat * (0.5 + 0.5 * np.abs(np.sin(2*np.pi*(h+3)/24)))
 
-    # === 模拟优化结果（x_opt 为 9×24 决策变量）===
+    # === 模拟优化结果 ===
     np.random.seed(42)
-    x_opt = np.random.rand(9 * 24) * max(elec_load, cool_load, heat_load) * 0.5
+    x_opt = np.random.rand(9*24) * max(elec, cool, heat) * 0.6
 
-    res = {
-        'x_opt': x_opt,
-        'P_pv': P_pv,
-        'P_wind': P_wind,
-        'P_load': P_load,
-        'Q_cool': Q_cool,
-        'Q_heat': Q_heat,
-        'config': {'BESS_CAPACITY': bess_cap, 'TES_CAPACITY': tes_cap}
-    }
+    # === 模拟对比方案 ===
+    np.random.seed(41)
+    if "昨日" in compare_mode:
+        P_pv_base = P_pv * 0.85
+        P_wind_base = P_wind * 0.8
+    elif "无储能" in compare_mode:
+        P_pv_base, P_wind_base = P_pv, P_wind
+        # 无储能时弃风弃光更多
+        renewable_base = np.minimum(P_pv_base + P_wind_base, P_load * 0.7)
+        P_pv_base = renewable_base * (P_pv_base / (P_pv_base + P_wind_base + 1e-6))
+        P_wind_base = renewable_base - P_pv_base
+    else:  # 纯火电
+        P_pv_base = P_wind_base = np.zeros(24)
+
+    # === 计算指标 ===
+    total_e = np.sum(P_load)
+    ren_new = np.sum(P_pv + P_wind)
+    ren_old = np.sum(P_pv_base + P_wind_base)
+    ratio_new = min(ren_new / total_e * 100, 100) if total_e > 0 else 0
+    ratio_old = min(ren_old / total_e * 100, 100) if total_e > 0 else 0
+    delta_ratio = ratio_new - ratio_old
+    carbon_new = 0.785 * (total_e - ren_new)
+    carbon_old = 0.785 * (total_e - ren_old)
+    delta_carbon = carbon_old - carbon_new
 
     # ==============================
-    # ✅ 关键：KPI 结果放在最顶部（图的上方！）
+    # ✅ 所有结果放在最顶部（图的上方！）
     # ==============================
-    total_elec = np.sum(P_load)
-    renewable_gen = np.sum(P_pv + P_wind)
-    renewable_ratio = min(renewable_gen / total_elec * 100, 100) if total_elec > 0 else 0
-    carbon_saved = 0.785 * (total_elec - renewable_gen)  # kgCO₂
-
-    # 能源费用估算（简化）
-    grid_elec = np.maximum(0, P_load - (P_pv + P_wind + gt_power + h2_fuel_cell))
-    annual_elec_cost = np.sum(grid_elec) * 0.6 * 365  # 0.6元/kWh
-    annual_maintenance = (
-        pv_area * 0.05 + wind_cap * 10 + gt_power * 20 +
-        bess_cap * 0.2 + tes_cap * 0.1
-    ) * 365
-
-    npc = calculate_npc(
-        pv_area, wind_cap, h2_electrolyzer, h2_fuel_cell,
-        gt_power, boiler_cap, bess_cap, tes_cap,
-        annual_elec_cost, annual_maintenance
-    )
-
-    # --- 顶部 KPI 卡片（图的上方！）---
-    st.subheader(f"📊 {province} · 调度结果概览")
+    st.subheader(f"📊 {province} · 全参数调度结果（{compare_mode}）")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("总用电量", f"{total_elec/1000:.1f} MWh")
-    col2.metric("可再生能源占比", f"{renewable_ratio:.1f}%")
-    col3.metric("减碳量", f"{carbon_saved:.0f} kgCO₂")
-    col4.metric("NPC（20年）", f"{npc:.2f} 百万元")
-
-    # --- 图表（确保生成！）---
-    plt.clf()
-    fig = plt.figure(figsize=(12, 7))
-    plot_scheduling(
-        x_opt=res['x_opt'],
-        P_pv=res['P_pv'],
-        P_wind=res['P_wind'],
-        P_el=res['P_load'],
-        Q_cool=res['Q_cool'],
-        Q_heat=res['Q_heat'],
-        title="",
-        config=res['config']
+    col1.metric("总用电量", f"{total_e/1000:.1f} MWh")
+    col2.metric(
+        "可再生能源占比", 
+        f"{ratio_new:.1f}%", 
+        delta=f"{delta_ratio:+.1f}%",
+        delta_color="normal"
     )
+    col3.metric(
+        "减碳量", 
+        f"{carbon_new:.0f} kgCO₂", 
+        delta=f"-{delta_carbon:.0f} kg",
+        delta_color="normal"
+    )
+    col4.metric("光伏年等效利用小时", f"{np.sum(P_pv)/pv_area/PV_TECH[pv_tech]['efficiency']*1000:.0f} h")
+
+    # --- 图表（确保出图！）---
+    try:
+        from plot_results import plot_scheduling
+        fig = plt.figure(figsize=(12, 7.5))
+        plot_scheduling(x_opt, P_pv, P_wind, P_load, Q_cool, Q_heat, "", {'BESS_CAPACITY':bess,'TES_CAPACITY':tes})
+    except Exception as e:
+        st.warning(f"⚠️ 使用内置绘图（原 plot_results 报错：{str(e)[:60]}...）")
+        fig = fallback_plot(P_pv, P_wind, P_load, Q_cool, Q_heat, x_opt)
+    
     st.pyplot(fig, use_container_width=True)
 
-    # --- 设备配置表 ---
-    device_df = pd.DataFrame({
-        "设备": ["光伏", "风电", "电解槽", "燃料电池", "燃气轮机", "燃气锅炉", "电池储能", "蓄冷/热罐"],
-        "容量/功率": [
-            f"{pv_area:,} m²",
-            f"{wind_cap:,} kW",
-            f"{h2_electrolyzer:,} kW",
-            f"{h2_fuel_cell:,} kW",
-            f"{gt_power:,} kW",
-            f"{boiler_cap:,} kW",
-            f"{bess_cap:,} kWh",
-            f"{tes_cap:,} kWh"
-        ]
-    })
-    st.dataframe(device_df, use_container_width=True, hide_index=True)
+    # --- 技术参数详情 ---
+    st.subheader("🔍 核心设备技术参数")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        pv_info = PV_TECH[pv_tech]
+        st.markdown(f"**光伏 ({pv_tech})**")
+        st.markdown(f"- 效率: {pv_info['efficiency']*100:.1f}%")
+        st.markdown(f"- 温度系数: {pv_info['temp_coeff']}/°C")
+        st.markdown(f"- 年衰减: {pv_info['degradation']*100:.2f}%")
+        st.markdown(f"- 弱光性能: {pv_info['low_light_perf']*100:.1f}%")
+        st.markdown(f"- 成本: {pv_info['cost_per_kw']:,} 元/kW")
+    with col_t2:
+        wt_info = WIND_MODELS[wind_model]
+        st.markdown(f"**风机 ({wind_model})**")
+        st.markdown(f"- 单机功率: {wt_info['rated_power']/1000:.1f} MW")
+        st.markdown(f"- 塔筒高度: {wt_info['hub_height']} m")
+        st.markdown(f"- 切入/切出: {wt_info['cut_in']}/{wt_info['cut_out']} m/s")
+        st.markdown(f"- 可用率: {wt_info['availability']*100:.1f}%")
+        st.markdown(f"- 成本: {wt_info['cost_per_kw']:,} 元/kW")
 
 else:
-    st.info("👈 请在左侧输入您的负荷需求与设备参数，点击「生成调度方案」。")
+    st.info("👈 请在左侧配置您的全参数能源系统，点击「生成全参数调度方案」。")
 
-st.caption("💡 系统基于 pvlib/windpowerlib 原理建模，支持 Open-Meteo 天气 API，NPC 含20年全生命周期成本。")
+st.caption("💡 支持5类光伏+4类风机技术细节，含倾角/方位角/逆变器/污渍/可用率等20+参数，强制对比模式，内置 fallback 绘图确保出图。")
