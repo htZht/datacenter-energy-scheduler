@@ -52,4 +52,4 @@ def plot_scheduling(x_opt, P_pv, P_wind, P_el, Q_cool, Q_heat, title, config=Non
     
     plt.suptitle(title)
     plt.tight_layout()
-    plt.show()
+    #plt.show()
