@@ -43,6 +43,11 @@ WIND_MODELS = {
     "海上 Haliade-X 14MW": {"rated_power": 14000, "cut_in": 4, "cut_out": 28, "rated_wind": 13}
 }
 
+GT_MODELS = {
+    "LM2500+ (30MW)": {"min_load": 0.3, "efficiency": 0.38, "fuel_cost": 0.30},
+    "Frame 7FA (170MW)": {"min_load": 0.4, "efficiency": 0.36, "fuel_cost": 0.28},
+    "小型燃气轮机 (5MW)": {"min_load": 0.2, "efficiency": 0.32, "fuel_cost": 0.32}
+}
 # ====== 【模块】天气与负荷模拟 ======
 def get_weather(province):
     seed = int(hashlib.md5(province.encode()).hexdigest()[:6], 16) % 100
@@ -54,14 +59,17 @@ def get_weather(province):
     temp = 18 + 12 * np.sin(np.arange(24)/24*2*np.pi - np.pi/2) + 4 * np.random.randn(24)
     return ghi, wind, temp
 
+
 # ====== 【模块】光伏/风电模型（考虑所有参数）======
-def calc_pv(ghi, area, tech, temp, tilt=25, inv_eff=0.97, soiling=0.03):
+def calc_pv(ghi, area, tech, temp, tilt, azimuth, inv_eff, soiling_loss):
     t = PV_TECH[tech]
-    cos_inc = max(0, np.cos(np.radians(tilt)))  # 防止负值
-    effective_ghi = ghi * cos_inc * t["low_light_perf"]
+    # 简化入射角模型
+    cos_incidence = max(0.2, np.cos(np.radians(tilt)) * 0.9 + 0.1)
+    effective_ghi = ghi * cos_incidence * t["low_light_perf"]
     power_dc = effective_ghi * area * t["efficiency"] / 1000
     power_dc *= (1 + t["temp_coeff"] * (temp - 25))
-    return np.clip(power_dc * inv_eff * (1 - soiling), 0, None)
+    ac_power = power_dc * inv_eff * (1 - soiling_loss)
+    return np.clip(ac_power, 0, None)
 
 def calc_wind(wind_speed, model, n_turbines):
     m = WIND_MODELS[model]
@@ -169,22 +177,28 @@ def get_hardware_data():
 
 # ====== 【主程序】Streamlit 应用 ======
 st.set_page_config(page_title="能源调度平台 - 开箱即用版", layout="wide")
-st.title("⚡ 多能协同调度平台（无报错 · 单文件 · 全功能）")
+st.title("⚡ 多能协同调度平台")
 
 # ====== 侧边栏：配置 + 开关 ======
 with st.sidebar:
+   st.divider()
+   st.subheader("🌍 地理与规模")
+region = st.selectbox("选择大区", list(REGIONS.keys()))
+province = st.selectbox("选择省份", REGIONS[region])
+      
+       # 负荷
+    st.divider()
+    st.subheader("📈 Load Profiles")
+    base_elec = st.slider("Base Electric Load (kW)", 500, 10000, 3000)
+    cool_ratio = st.slider("Cooling Load Ratio", 0.0, 1.0, 0.5)
+    heat_ratio = st.slider("Heating Load Ratio", 0.0, 1.0, 0.4)
+
     st.subheader("🔧 设备开关")
     pv_on = st.checkbox("光伏系统", True)
     wind_on = st.checkbox("风电系统", True)
     gt_on = st.checkbox("燃气轮机", True)
     h2_on = st.checkbox("氢能系统", True)
     monitor_on = st.checkbox("硬件监测", True)
-    
-    st.divider()
-    st.subheader("🌍 地理与规模")
-    region = st.selectbox("选择大区", list(REGIONS.keys()))
-    province = st.selectbox("选择省份", REGIONS[region])
-    base_load = st.slider("基础电负荷 (kW)", 500, 10000, 3000)
     
     st.subheader("☀️ 光伏参数")
     pv_type = st.selectbox("光伏技术", list(PV_TECH.keys()))
@@ -193,6 +207,20 @@ with st.sidebar:
     st.subheader("💨 风电参数")
     wt_type = st.selectbox("风机型号", list(WIND_MODELS.keys()))
     n_wt = st.number_input("风机数量", 0, 50, 3)
+    # 燃气轮机（新增硬件参数）
+    st.divider()
+    st.subheader("🔥 Gas Turbine")
+    gt_on = st.checkbox("Enable Gas Turbine", True)
+    if gt_on:
+        gt_type = st.selectbox("GT Model", list(GT_MODELS.keys()))
+        gt_capacity = st.number_input("Rated Capacity (kW)", 1000, 200000, 5000)
+    
+    # 锅炉
+    st.divider()
+    st.subheader("♨️ Thermal Systems")
+    boiler_cap = st.number_input("Gas Boiler Capacity (kW)", 0, 50000, 3000)
+    h2_on = st.checkbox("Enable H₂ Fuel Cell", False)
+    h2_cap = st.number_input("H₂ Fuel Cell Capacity (kW)", 0, 5000, 1000 if h2_on else 0)
 
 # ====== 主界面 ======
 if st.button("🚀 生成调度方案", type="primary"):
