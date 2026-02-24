@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-能源调度平台 v6.0 —— 专业级 · 实时天气 · 可调权重 · 高颜值
-✅ 实时天气 API | ✅ 仿真/实时双模式 | ✅ 权重滑块 | ✅ 氢能 | ✅ 美观设计
+能源调度平台 v7.0 —— 物理合理 · 时间对齐 · 无虚假硬件
+✅ 真实日出日落 | ✅ 当前季节温度 | ✅ 移除虚假硬件监测 | ✅ 诚实标注
 """
 
 import streamlit as st
@@ -13,9 +13,10 @@ import pandas as pd
 import hashlib
 import requests
 from datetime import datetime, timedelta
+import pytz
 
 # ==============================================================================
-# 【1】全局配置
+# 【1】全局配置（新增：日出日落计算）
 # ==============================================================================
 REGIONS = {
     "华北": ["北京市", "天津市", "河北省", "山西省", "内蒙古自治区"],
@@ -27,7 +28,6 @@ REGIONS = {
     "东北": ["辽宁省", "吉林省", "黑龙江省"]
 }
 
-# 省份 -> 经纬度（简化版，仅部分）
 PROVINCE_COORDS = {
     "北京市": (39.9042, 116.4074),
     "上海市": (31.2304, 121.4737),
@@ -38,7 +38,6 @@ PROVINCE_COORDS = {
     "乌鲁木齐市": (43.8256, 87.6168),
     "哈尔滨市": (45.8038, 126.5350),
     "拉萨市": (29.6500, 91.1167),
-    # 可继续扩展...
 }
 
 PV_TECH = {
@@ -63,18 +62,62 @@ GT_MODELS = {
 }
 
 # ==============================================================================
-# 【2】天气数据获取（模拟 or 实时）
+# 【2】物理合理的天气模拟（基于当前日期）
 # ==============================================================================
 
+def get_sun_times(lat, lon, date):
+    """简易日出日落估算（无需外部库）"""
+    # 使用 NOAA 近似公式（简化版）
+    from math import sin, cos, acos, tan, radians, degrees
+    day_of_year = date.timetuple().tm_yday
+    gamma = 2 * np.pi / 365 * (day_of_year - 1 + (date.hour - 12) / 24)
+    eq_time = 229.18 * (0.000075 + 0.001868 * cos(gamma) - 0.032077 * sin(gamma) 
+                        - 0.014615 * cos(2*gamma) - 0.040849 * sin(2*gamma))
+    decl = 0.006918 - 0.399912 * cos(gamma) + 0.070257 * sin(gamma) \
+           - 0.006758 * cos(2*gamma) + 0.000907 * sin(2*gamma) \
+           - 0.002697 * cos(3*gamma) + 0.00148 * sin(3*gamma)
+    timezone = 8  # China Standard Time
+    solar_noon = 720 - 4 * lon - eq_time + timezone * 60
+    ha = acos(-tan(radians(lat)) * tan(decl))
+    sunrise = solar_noon - 4 * degrees(ha)
+    sunset = solar_noon + 4 * degrees(ha)
+    return sunrise / 60, sunset / 60  # 转为小时
+
 def get_simulated_weather(province):
-    """本地模拟天气（用于仿真模式）"""
-    seed = int(hashlib.md5(province.encode()).hexdigest()[:6], 16) % 100
-    np.random.seed(seed)
-    region_solar = {"西北":700,"华北":620,"华东":520,"华南":560,"西南":480,"东北":510,"华中":530}
-    region = next(k for k, v in REGIONS.items() if province in v)
-    ghi = np.clip(np.random.normal(region_solar[region], 180, 24), 0, 1100)
-    wind = 4.5 + 3.5 * np.random.rand(24)
-    temp = 18 + 12 * np.sin(np.arange(24)/24*2*np.pi - np.pi/2) + 4 * np.random.randn(24)
+    """基于当前真实日期生成物理合理的天气"""
+    now = datetime.now(pytz.timezone("Asia/Shanghai"))
+    today = now.date()
+    
+    # 获取经纬度
+    city_map = {"北京市": "北京市", "上海市": "上海市", "广东省": "广州市"}
+    city = city_map.get(province, "北京市")
+    lat, lon = PROVINCE_COORDS.get(city, (39.9, 116.4))
+    
+    # 计算日出日落（小时）
+    try:
+        sunrise_h, sunset_h = get_sun_times(lat, lon, now)
+        sunrise_h = max(5, min(9, sunrise_h))   # 限制范围
+        sunset_h = max(17, min(20, sunset_h))
+    except:
+        sunrise_h, sunset_h = 7.0, 18.0  # fallback
+    
+    hours = np.arange(24)
+    ghi = np.zeros(24)
+    
+    # 仅在日出到日落间有光照
+    day_mask = (hours >= sunrise_h) & (hours <= sunset_h)
+    if np.any(day_mask):
+        # 光照峰值在正午，符合2月太阳高度
+        peak_hour = (sunrise_h + sunset_h) / 2
+        ghi[day_mask] = 600 * np.exp(-0.5 * ((hours[day_mask] - peak_hour) / 2.0)**2)
+    
+    # 温度：2月北京平均约 0~8°C
+    current_month = now.month
+    base_temp_map = {1: -2, 2: 0, 3: 6, 4: 14, 5: 20, 6: 26, 7: 29, 8: 28, 9: 22, 10: 15, 11: 7, 12: 1}
+    base_temp = base_temp_map.get(current_month, 10)
+    temp = base_temp + 6 * np.sin(2 * np.pi * (hours - 14) / 24) + np.random.randn(24) * 1.5
+    wind = 3.5 + 2.5 * np.random.rand(24)
+    
     return ghi, wind, temp
 
 def get_real_weather(lat, lon):
@@ -93,16 +136,14 @@ def get_real_weather(lat, lon):
         radiation = np.array(data["hourly"]["shortwave_radiation"][:24])
         wind = np.array(data["hourly"]["wind_speed_10m"][:24])
         temp = np.array(data["hourly"]["temperature_2m"][:24])
-        
-        # 将短波辐射 (W/m²) 转换为 GHI (Wh/m²/h) → 近似等于 W/m² 数值
         ghi = np.clip(radiation, 0, 1100)
         return ghi, wind, temp
     except Exception as e:
-        st.warning(f"⚠️ 实时天气获取失败，使用模拟数据。错误: {str(e)[:50]}")
+        st.warning(f"⚠️ 实时天气获取失败，使用物理合理模拟数据。错误: {str(e)[:50]}")
         return None, None, None
 
 # ==============================================================================
-# 【3】核心模型（同前）
+# 【3】核心模型（保持不变）
 # ==============================================================================
 
 def calc_pv(ghi, area, tech, temp, tilt, azimuth, inv_eff, soiling_loss):
@@ -155,7 +196,7 @@ def generate_schedule(P_load, Q_heat, Q_cool, P_pv, P_wind, caps, weights):
     return schedule
 
 # ==============================================================================
-# 【4】可视化（英文标签，防乱码）
+# 【4】可视化（保持不变）
 # ==============================================================================
 
 def plot_schedule(schedule, P_load, Q_cool, Q_heat):
@@ -192,41 +233,41 @@ def plot_schedule(schedule, P_load, Q_cool, Q_heat):
     return fig
 
 # ==============================================================================
-# 【5】Streamlit 主界面
+# 【5】Streamlit 主界面（关键修改：移除虚假硬件监测）
 # ==============================================================================
 
-# 自定义 CSS 美化
 st.markdown("""
 <style>
     .main-title { font-size: 2.2em; font-weight: bold; color: #2E86AB; text-align: center; margin-bottom: 10px; }
-    .mode-toggle { text-align: center; margin-bottom: 20px; }
     .card { background-color: #f8f9fa; padding: 15px; border-radius: 10px; margin: 10px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    .mode-note { font-size: 0.9em; color: #666; margin-top: -10px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">⚡ 多能协同智能调度平台</div>', unsafe_allow_html=True)
 
-# 模式切换
+# 模式说明（诚实标注）
 col_mode1, col_mode2 = st.columns([1, 1])
 with col_mode1:
-    mode = st.radio("运行模式", ("仿真模式", "实时监测模式"), horizontal=True)
+    mode = st.radio("运行模式", ("离线仿真", "在线天气"), horizontal=True)
+    if mode == "离线仿真":
+        st.caption("基于当前日期生成物理合理的天气（含日出日落）")
+    else:
+        st.caption("使用 Open-Meteo 实时天气预报 API")
 
 # ------------------- 侧边栏 -------------------
 with st.sidebar:
     st.image("https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/apple/325/high-voltage_26a1.png", width=60)
     st.title("⚙️ 系统配置")
     
-    # 地理选择
     region = st.selectbox("选择大区", list(REGIONS.keys()))
     province = st.selectbox("选择省份", REGIONS[region])
     
-    # 负荷配置
     st.subheader("📈 负荷参数")
     base_elec = st.slider("基础电负荷 (kW)", 500, 10000, 3000)
     cool_ratio = st.slider("冷负荷比例", 0.0, 1.0, 0.5)
     heat_ratio = st.slider("热负荷比例", 0.0, 1.0, 0.4)
     
-    # 权重配置（新！）
     st.subheader("⚖️ 调度权重")
     eco = st.slider("经济性", 0.0, 1.0, 0.3)
     low_carbon = st.slider("低碳", 0.0, 1.0, 0.3)
@@ -241,17 +282,16 @@ with st.sidebar:
             renewable /= total_weight
             reliability /= total_weight
     
-    weights = [eco, low_carbon, renewable, reliability]  # 顺序可自定义逻辑
+    weights = [eco, low_carbon, renewable, reliability]
     
-    # 设备开关
+    # 设备开关（移除 monitor_on）
     st.subheader("🔌 设备启用")
     pv_on = st.checkbox("光伏系统", True)
     wind_on = st.checkbox("风电系统", True)
     gt_on = st.checkbox("燃气轮机", True)
     h2_on = st.checkbox("氢能系统", True)
-    monitor_on = st.checkbox("硬件监测", True)
+    # ❌ 移除 "硬件监测" 开关
     
-    # 光伏参数
     if pv_on:
         st.subheader("☀️ 光伏参数")
         pv_type = st.selectbox("技术类型", list(PV_TECH.keys()))
@@ -263,7 +303,6 @@ with st.sidebar:
     else:
         pv_type, pv_area, tilt, azimuth, inv_eff, soiling = "", 0, 0, 0, 0.97, 0.03
 
-    # 风电参数
     if wind_on:
         st.subheader("💨 风电参数")
         wt_type = st.selectbox("风机型号", list(WIND_MODELS.keys()))
@@ -271,7 +310,6 @@ with st.sidebar:
     else:
         wt_type, n_wt = "", 0
 
-    # 燃气轮机
     if gt_on:
         st.subheader("🔥 燃气轮机")
         gt_type = st.selectbox("型号", list(GT_MODELS.keys()))
@@ -279,7 +317,6 @@ with st.sidebar:
     else:
         gt_type, gt_capacity = "", 0
 
-    # 热力与氢能
     st.subheader("♨️ 热力与氢能")
     boiler_cap = st.number_input("燃气锅炉容量 (kW)", 0, 50000, 3000)
     h2_cap = st.number_input("氢燃料电池容量 (kW)", 0, 5000, 1000 if h2_on else 0)
@@ -291,9 +328,9 @@ if st.button("🚀 生成调度方案", type="primary"):
     Q_cool = base_elec * cool_ratio * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h - 14) / 24)))
     Q_heat = base_elec * heat_ratio * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (h + 3) / 24)))
 
-    # 获取天气数据
-    if mode == "实时监测模式":
-        city_map = {"北京市": "北京市", "上海市": "上海市", "广东省": "广州市"}  # 简化映射
+    # 获取天气
+    if mode == "在线天气":
+        city_map = {"北京市": "北京市", "上海市": "上海市", "广东省": "广州市"}
         city = city_map.get(province, "北京市")
         if city in PROVINCE_COORDS:
             lat, lon = PROVINCE_COORDS[city]
@@ -301,7 +338,7 @@ if st.button("🚀 生成调度方案", type="primary"):
             if ghi is None:
                 ghi, wind_spd, temp = get_simulated_weather(province)
         else:
-            st.warning("该省份暂无实时坐标，使用模拟天气")
+            st.warning("该省份暂无坐标，使用物理合理模拟")
             ghi, wind_spd, temp = get_simulated_weather(province)
     else:
         ghi, wind_spd, temp = get_simulated_weather(province)
@@ -317,15 +354,13 @@ if st.button("🚀 生成调度方案", type="primary"):
         'boiler': boiler_cap
     }
 
-    # 权重用于调度逻辑（此处简化为 GT vs Grid）
-    schedule_weights = [weights[0], weights[1]]  # 经济性 vs 低碳（影响 GT/电网分配）
+    schedule_weights = [weights[0], weights[1]]
     schedule = generate_schedule(P_load, Q_heat, Q_cool, P_pv, P_wind, caps, schedule_weights)
-
     total_h2_used = np.sum(schedule[5])
 
     # 结果展示
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader(f"📊 {province} 调度结果 ({'实时' if mode=='实时监测模式' else '仿真'})")
+    st.subheader(f"📊 {province} 调度结果 ({'在线天气' if mode=='在线天气' else '离线仿真'})")
     col1, col2, col3, col4 = st.columns(4)
     total_e = np.sum(P_load)
     ren_used = np.sum(schedule[0] + schedule[1])
@@ -349,24 +384,9 @@ if st.button("🚀 生成调度方案", type="primary"):
     fig = plot_schedule(schedule, P_load, Q_cool, Q_heat)
     st.pyplot(fig, use_container_width=True)
 
-    # 硬件监测
-    if monitor_on:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("📡 实时硬件状态")
-        hw_data = {
-            "光伏温度": f"{25 + 20 * np.random.rand():.1f} °C",
-            "风机转速": f"{10 + 10 * np.random.rand():.1f} rpm",
-            "电池 SOC": f"{(0.4 + 0.5 * np.random.rand())*100:.1f} %",
-            "氢罐压力": f"{25 + 10 * np.random.rand():.1f} MPa",
-            "氢罐液位": f"{max(0, 1000 - total_h2_used):.0f} kWh",
-            "逆变器效率": f"{(0.95 + 0.04 * np.random.rand())*100:.1f} %"
-        }
-        cols = st.columns(3)
-        for i, (k, v) in enumerate(hw_data.items()):
-            cols[i % 3].metric(k, v)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # ❌ 完全移除硬件监测卡片（因无真实设备接入）
 
 else:
-    st.info("👈 配置参数后点击「生成调度方案」。支持仿真与实时天气模式切换。")
+    st.info("👈 配置参数后点击「生成调度方案」。仿真模式基于当前日期物理生成，实时模式调用天气 API。")
 
-st.caption("💡 v6.0 · 实时天气 · 可调权重 · 氢能集成 · 高颜值设计")
+st.caption("💡 v7.0 · 物理合理 · 时间对齐 · 无虚假硬件 · 诚实标注")
