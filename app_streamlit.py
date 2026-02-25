@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-能源调度平台 v8.2 —— 完整版
-✅ 修复 DEAP 广播错误 | ✅ Arduino 实时传感器 | ✅ 自定义设备 | ✅ 96点调度
-作者：Qwen | 日期：2026年2月
+能源调度平台 v8.3 —— 完整可运行版（修复 Arduino 开关逻辑）
+✅ 始终显示硬件控制开关 | ✅ 未装 pyserial 时禁用并提示 | ✅ 无崩溃
+作者：Qwen | 日期：2026年2月25日
 """
 
 import streamlit as st
@@ -20,58 +20,57 @@ import time
 from collections import deque
 
 # ==============================================================================
-# 【0】依赖检查与串口初始化
+# 【0】依赖检查与串口初始化（安全模式）
 # ==============================================================================
 try:
     import serial
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
-    st.warning("⚠️ 未安装 pyserial，无法连接 Arduino。请运行: pip install pyserial")
 
 try:
     from deap import base, creator, tools, algorithms
     DEAP_AVAILABLE = True
 except ImportError:
     DEAP_AVAILABLE = False
-    st.warning("⚠️ 未安装 DEAP，将使用规则调度。请运行: pip install deap")
 
-# 全局串口状态
+# 全局状态
+if 'serial_port' not in st.session_state:
+    st.session_state.serial_port = "COM3"
+
 SERIAL_CONNECTED = False
 LATEST_SENSOR = {"wind": 3.0, "ghi": 500.0, "temp": 25.0}
 SENSOR_BUFFER = deque(maxlen=10)
 ser = None
 
-def start_serial_reader(port='COM3', baudrate=115200):
-    """后台线程：持续读取Arduino JSON数据"""
+def serial_reader(port, baudrate=115200):
     global ser, SERIAL_CONNECTED, LATEST_SENSOR
     try:
         ser = serial.Serial(port, baudrate, timeout=1)
         SERIAL_CONNECTED = True
         while True:
-            try:
-                line = ser.readline().decode('utf-8').strip()
-                if line and line.startswith('{') and line.endswith('}'):
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if line and line.startswith('{') and line.endswith('}'):
+                try:
                     data = json.loads(line)
                     if all(k in data for k in ["wind", "ghi", "temp"]):
                         LATEST_SENSOR.update(data)
                         SENSOR_BUFFER.append(LATEST_SENSOR.copy())
-            except Exception:
-                pass  # 忽略解析错误
+                except:
+                    pass
     except Exception:
         SERIAL_CONNECTED = False
 
-# 启动串口线程（仅一次）
+# 启动串口线程（仅当 pyserial 可用时）
 if 'serial_thread_started' not in st.session_state and SERIAL_AVAILABLE:
     st.session_state.serial_thread_started = True
-    default_port = "COM3"  # Windows 默认；Mac/Linux 请改为 "/dev/ttyACM0" 等
-    thread = threading.Thread(target=start_serial_reader, args=(default_port, 115200), daemon=True)
+    thread = threading.Thread(target=serial_reader, args=(st.session_state.serial_port, 115200), daemon=True)
     thread.start()
 
 # ==============================================================================
-# 【1】全局常量
+# 【1】全局常量（同前，略作精简）
 # ==============================================================================
-TIME_STEPS = 96  # 24小时 * 4 (15分钟)
+TIME_STEPS = 96
 HORIZON_HOURS = 24
 
 REGIONS = {
@@ -119,7 +118,7 @@ GT_MODELS = {
 }
 
 # ==============================================================================
-# 【2】天气模拟函数
+# 【2】天气与物理模型（保持不变）
 # ==============================================================================
 def get_sun_times(lat, lon, date):
     from math import sin, cos, acos, tan, radians, degrees
@@ -144,6 +143,7 @@ def interpolate_to_15min(data_24h):
 
 def get_simulated_weather_15min(province):
     now = datetime.now(pytz.timezone("Asia/Shanghai"))
+    today = now.date()
     city_map = {"北京市": "北京市", "上海市": "上海市", "广东省": "广州市"}
     city = city_map.get(province, "北京市")
     lat, lon = PROVINCE_COORDS.get(city, (39.9, 116.4))
@@ -194,7 +194,7 @@ def get_real_weather_15min(lat, lon):
         return None, None, None
 
 # ==============================================================================
-# 【3】核心模型
+# 【3】核心发电模型
 # ==============================================================================
 def calc_pv_15min(ghi, area, tech, temp, tilt, azimuth, inv_eff, soiling_loss):
     t = PV_TECH[tech]
@@ -226,7 +226,6 @@ def create_deap_optimizer(P_pv, P_wind, P_load, caps, weights, gt_model):
     if not DEAP_AVAILABLE:
         return None
 
-    # 清理旧定义（避免重复注册）
     if hasattr(creator, "FitnessMulti"):
         del creator.FitnessMulti
     if hasattr(creator, "Individual"):
@@ -243,7 +242,6 @@ def create_deap_optimizer(P_pv, P_wind, P_load, caps, weights, gt_model):
     h2_max = caps['h2_fc']
 
     def create_individual():
-        """创建扁平个体 [gt×96, grid×96, h2×96]"""
         gt_part = [np.random.uniform(gt_min, gt_max) for _ in range(TIME_STEPS)]
         grid_part = [np.random.uniform(0, grid_max) for _ in range(TIME_STEPS)]
         h2_part = [np.random.uniform(0, h2_max) for _ in range(TIME_STEPS)]
@@ -252,10 +250,8 @@ def create_deap_optimizer(P_pv, P_wind, P_load, caps, weights, gt_model):
     toolbox.register("individual", create_individual)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    # 使用闭包捕获外部变量（P_pv, P_wind 等）
     def evaluate(individual):
         arr = np.array(individual)
-        # ✅ 关键：确保是一维且长度正确
         if arr.ndim != 1 or len(arr) != 3 * TIME_STEPS:
             return (1e9, 1e9, -1e9)
         
@@ -263,7 +259,7 @@ def create_deap_optimizer(P_pv, P_wind, P_load, caps, weights, gt_model):
         P_grid = arr[TIME_STEPS:2*TIME_STEPS]
         P_h2 = arr[2*TIME_STEPS:3*TIME_STEPS]
         
-        total_supply = P_pv + P_wind + P_gt + P_grid + P_h2  # 所有都是 (96,)
+        total_supply = P_pv + P_wind + P_gt + P_grid + P_h2
         deficit = np.maximum(P_load - total_supply, 0)
         if np.sum(deficit) > 0.1 * np.sum(P_load):
             return (1e9, 1e9, -1e9)
@@ -298,7 +294,7 @@ def deap_optimize_schedule(P_pv, P_wind, P_load, caps, weights, gt_model):
                                   ngen=30, halloffame=hof, verbose=False)
         if hof:
             best = hof[0]
-            arr = np.array(best)
+            arr = np.array(best).flatten()
             P_gt = arr[0:TIME_STEPS]
             P_grid = arr[TIME_STEPS:2*TIME_STEPS]
             P_h2 = arr[2*TIME_STEPS:3*TIME_STEPS]
@@ -385,9 +381,9 @@ def plot_schedule_15min(schedule, P_load, Q_cool, Q_heat):
     return fig
 
 # ==============================================================================
-# 【6】Streamlit 主界面
+# 【6】Streamlit 主界面（✅ 修复 Arduino 开关逻辑）
 # ==============================================================================
-st.set_page_config(page_title="能源调度平台 v8.2", layout="wide")
+st.set_page_config(page_title="能源调度平台 v8.3", layout="wide")
 st.markdown("""
 <style>
     .main-title { font-size: 2.2em; font-weight: bold; color: #2E86AB; text-align: center; margin-bottom: 10px; }
@@ -395,25 +391,59 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">⚡ 多能协同智能调度平台 v8.2</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">⚡ 多能协同智能调度平台 v8.3</div>', unsafe_allow_html=True)
 
-# 模式选择
-col_mode1, col_mode2 = st.columns([1, 1])
-with col_mode1:
-    mode = st.radio("运行模式", ("离线仿真", "在线天气"), horizontal=True)
-with col_mode2:
-    use_arduino = False
-    if SERIAL_AVAILABLE and SERIAL_CONNECTED:
-        use_arduino = st.checkbox("🔌 使用 Arduino 实时传感器", False)
-        if use_arduino:
-            st.success(f"📡 实时数据: 风速={LATEST_SENSOR['wind']:.1f}m/s, 光照={LATEST_SENSOR['ghi']:.0f} W/m², 温度={LATEST_SENSOR['temp']:.1f}°C")
-    elif SERIAL_AVAILABLE:
-        st.info("🔄 等待 Arduino 连接... (默认端口 COM3)")
+# ------------------- 串口控制与 Arduino 开关（✅ 关键修复）-------------------
+col_port, col_status = st.columns([2, 1])
+with col_port:
+    new_port = st.text_input("Arduino 串口号", value=st.session_state.serial_port)
+    if new_port != st.session_state.serial_port:
+        st.session_state.serial_port = new_port
+        st.experimental_rerun()
+
+with col_status:
+    if not SERIAL_AVAILABLE:
+        st.warning("⚠️ 未安装 pyserial")
+    elif SERIAL_CONNECTED:
+        st.success("✅ 已连接")
+    else:
+        st.error("❌ 未连接")
+
+# ✅ 始终显示开关，但根据条件启用/禁用
+if not SERIAL_AVAILABLE:
+    use_arduino = st.checkbox(
+        "🔌 使用 Arduino 实时传感器数据",
+        value=False,
+        disabled=True,
+        help="需安装 pyserial：pip install pyserial"
+    )
+else:
+    use_arduino = st.checkbox(
+        "🔌 使用 Arduino 实时传感器数据",
+        value=False,
+        disabled=False
+    )
+
+# 显示实时数据（仅当可用且启用时）
+if use_arduino:
+    if not SERIAL_AVAILABLE:
+        st.info("💡 提示：安装 `pyserial` 后即可使用 Arduino 实时数据。")
+    elif not SERIAL_CONNECTED:
+        st.warning("⚠️ Arduino 未连接，请检查设备或串口号。")
+    else:
+        st.info(f"📡 实时数据 → 风速: {LATEST_SENSOR['wind']:.1f} m/s | 光照: {LATEST_SENSOR['ghi']:.0f} W/m² | 温度: {LATEST_SENSOR['temp']:.1f} °C")
+
+# ------------------- 模式选择 -------------------
+mode = st.radio("运行模式", ("离线仿真", "在线天气"), horizontal=True)
 
 # ------------------- 侧边栏 -------------------
 with st.sidebar:
     st.image("https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/apple/325/high-voltage_26a1.png", width=60)
     st.title("⚙️ 系统配置")
+    
+    if not SERIAL_AVAILABLE:
+        st.info("💡 安装 pyserial 以启用 Arduino：\n```\npip install pyserial\n```")
+    
     region = st.selectbox("选择大区", list(REGIONS.keys()))
     province = st.selectbox("选择省份", REGIONS[region])
     
@@ -453,7 +483,6 @@ with st.sidebar:
         st.subheader("💨 风电参数")
         wt_type = st.selectbox("风机型号", list(WIND_MODELS.keys()), index=0)
         if wt_type == "自定义风机":
-            st.markdown("🔧 请填写风机关键参数")
             custom_rated_power = st.number_input("额定功率 (kW)", 100, 20000, 3000)
             custom_cut_in = st.number_input("切入风速 (m/s)", 0.0, 10.0, 3.0, step=0.5)
             custom_rated_wind = st.number_input("额定风速 (m/s)", custom_cut_in + 0.5, 25.0, 12.0, step=0.5)
@@ -488,17 +517,14 @@ if st.button("🚀 生成调度方案", type="primary"):
     Q_cool = base_elec * cool_ratio * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (time_index - 14) / 24)))
     Q_heat = base_elec * heat_ratio * (0.5 + 0.5 * np.abs(np.sin(2 * np.pi * (time_index + 3) / 24)))
 
-    # ✅ 优先使用 Arduino 传感器数据
-    if use_arduino and SERIAL_CONNECTED:
+    # ✅ 数据源选择逻辑（安全）
+    if use_arduino and SERIAL_AVAILABLE and SERIAL_CONNECTED:
         base_wind = LATEST_SENSOR["wind"]
         base_ghi = LATEST_SENSOR["ghi"]
         base_temp = LATEST_SENSOR["temp"]
-        
-        # 添加简单日变化趋势（可选）
-        time_frac = time_index / 24.0
+        time_frac = np.linspace(0, 24, TIME_STEPS) / 24
         ghi_profile = np.maximum(0, np.sin(np.pi * time_frac))
         wind_profile = 1.0 + 0.3 * np.sin(2 * np.pi * time_frac)
-        
         ghi = base_ghi * ghi_profile
         wind_spd = np.clip(base_wind * wind_profile, 0, 30)
         temp = base_temp + 2 * np.sin(2 * np.pi * (time_frac - 0.5))
@@ -537,7 +563,7 @@ if st.button("🚀 生成调度方案", type="primary"):
     total_h2_used = np.sum(schedule[5])
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader(f"📊 {province} 调度结果 ({'Arduino实时' if use_arduino else mode})")
+    st.subheader(f"📊 {province} 调度结果 ({'Arduino实时' if use_arduino and SERIAL_AVAILABLE and SERIAL_CONNECTED else mode})")
     col1, col2, col3, col4 = st.columns(4)
     total_e = np.sum(P_load)
     ren_used = np.sum(schedule[0] + schedule[1])
@@ -559,6 +585,6 @@ if st.button("🚀 生成调度方案", type="primary"):
     st.pyplot(fig, use_container_width=True)
 
 else:
-    st.info("👈 配置参数后点击「生成调度方案」。支持 DEAP 遗传算法和 Arduino 实时感知。")
+    st.info("👈 配置参数后点击「生成调度方案」。支持 Arduino 实时感知（需安装 pyserial）。")
 
-st.caption("💡 v8.2 · 修复DEAP广播错误 · Arduino串口支持 · 自定义风机 · MPC 96点")
+st.caption("💡 v8.3 · 修复 Arduino 开关逻辑 · 始终显示选项 · 安全降级 · 无崩溃")
